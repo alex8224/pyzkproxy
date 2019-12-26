@@ -11,6 +11,7 @@ zookeeper proxy
 
 from socket import socket, AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
 from functools import partial
+from collections import OrderedDict
 from Queue import Queue
 import threading
 import time
@@ -22,7 +23,7 @@ from StringIO import StringIO
 FORMAT = '%(asctime)-15s - %(threadName)s - %(message)s'
 logging.basicConfig(file="zkclient.log", filemode="w", format=FORMAT)
 logger = logging.getLogger('zkproxy')
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.WARN)
 
 
 class Node(object):
@@ -37,7 +38,7 @@ class Node(object):
 
 class ZkCache(object):
     def __init__(self):
-        self.map = {}
+        self.map = OrderedDict()
         self.lock = threading.Lock()
 
     def put(self, path, nodes):
@@ -46,7 +47,6 @@ class ZkCache(object):
             self.map[path] = nodes
         finally:
             self.lock.release()
-
 
     def get(self, path):
         return self.map.get(path)
@@ -299,6 +299,7 @@ class Stat(Record):
         self.dataLength       =  dataLength
         self.numChildren      =  numChildren
         self.pzxid            =  pzxid
+        return self
 
     def serialize(self, out):
         self.write_long(self.czxid, out)
@@ -379,6 +380,7 @@ class ReplyHeader(Record):
         self._xid = xid
         self._zxid = zxid
         self._err = err
+        return self
 
     @property
     def xid(self):
@@ -1302,13 +1304,59 @@ class ClientHandler(object):
                         req = reqcls().deserialize(self.rfile)
                         req_packet = Packet(req_header, req, ReplyHeader(), respcls())
                         logger.debug("req %s " % (req_packet, ))
-                        self.zkclient.send_packet((req_packet, self.callback))
+                        if not self.do_filter_handler(req_packet):
+                            self.zkclient.send_packet((req_packet, self.callback))
         except:
             logger.error("handle_read error %s" % (traceback.format_exc(), ))
             self.running = False
             self.state = ProxyState.DISCONNECTED
         finally:
             self.finish()
+
+
+    def init_filter_chain(self):
+        self.chain = {CreateReq: self.intecept_create, GetChildReq: self.intecept_getchild, ExistsReq: self.intecept_exists}
+
+    def do_filter_handler(self, packet):
+        handler = self.chain.get(packet.request.__class__)
+        if handler:
+            return handler(packet)
+            #return False
+        else:
+            return False
+
+    def intecept_create(self, create_req):
+        if zkCache.get(create_req.request.path):
+            #TODO set reply header to 
+            reply_header = create_req.reply_header
+            reply_header.build(create_req.header.xid, 0, ErrCode.NodeExists)
+            self.callback(create_req)
+            logger.warn("return cache for %s" % create_req)
+            return True
+        else:
+            return False
+
+    def intecept_exists(self, exists_req):
+        if zkCache.get(exists_req.request.path):
+            reply_header = exists_req.reply_header
+            reply_header.build(exists_req.header.xid, 0, 0)
+            response = exists_req.response
+            stat = Stat()
+            response.stat = Stat().build(0,0,0,0,0,0,0,0,0,0,0)
+            self.callback(exists_req)
+            logger.warn("return cache exists for %s" % exists_req)
+            return True
+
+
+    def intecept_getchild(self, getchild_req):
+        childrens = zkCache.get(getchild_req.request.path) or []
+        reply_header = getchild_req.reply_header
+        reply_header.build(getchild_req.header.xid, 0, 0)
+        response = getchild_req.response
+        response.childrens = childrens
+        self.callback(getchild_req)
+        logger.warn("return cache path's %s child in cache %s" % (getchild_req.request.path, childrens))
+        return True
 
     def send_pong(self):
         pong_packet = Packet(None, None, Pong(), None)
@@ -1331,6 +1379,7 @@ class ClientHandler(object):
                     send_buff(self.wfile, buff)
 
     def start(self):
+        self.init_filter_chain()
         self.zkclient.connect()
         self.zkclient.subscribe(self.process_event)
         reader = threading.Thread(target=self.handle_read)
@@ -1477,12 +1526,7 @@ class ControlMaster(object):
 
 if __name__ == "__main__":
 
-    # zkclient = ZkClient("192.168.10.217", 2182)
-    # zkclient.connect()
-    # threading.Thread(target=GetChildInteval(zkclient)).start()
-    # time.sleep(1000000000)
-
-    client = BlockZkClient("192.168.10.52", 2182)
+    client = BlockZkClient("192.168.10.217", 2182)
     client.connect()
     start = time.time()
     try:
@@ -1490,6 +1534,10 @@ if __name__ == "__main__":
         master = ControlMaster(bootstrap, 10, "192.168.10.217", 2182)
         master.start()
         master.wait()
+
+    # start zk proxy and start serve
+        zkproxy = ZkProxy("192.168.66.181", 2182, "192.168.10.217", 2182)
+        zkproxy.serve_forever()
     except:
         logger.error(traceback.format_exc())
 
@@ -1497,6 +1545,3 @@ if __name__ == "__main__":
     print("耗时 %f" % (time.time() - start))
 
 
-    #start zk proxy and start serve
-    #zkproxy = ZkProxy("192.168.66.181", 2182, "192.168.10.217", 2182)
-    #zkproxy.serve_forever()
