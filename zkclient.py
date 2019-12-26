@@ -10,6 +10,9 @@ zookeeper proxy
 # monkey.patch_all()
 
 from socket import socket, AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
+from functools import partial
+from Queue import Queue
+import threading
 import time
 import struct
 import traceback
@@ -19,7 +22,7 @@ from StringIO import StringIO
 FORMAT = '%(asctime)-15s - %(threadName)s - %(message)s'
 logging.basicConfig(file="zkclient.log", filemode="w", format=FORMAT)
 logger = logging.getLogger('zkproxy')
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 class Node(object):
@@ -35,9 +38,15 @@ class Node(object):
 class ZkCache(object):
     def __init__(self):
         self.map = {}
+        self.lock = threading.Lock()
 
     def put(self, path, nodes):
-        self.map[path] = nodes
+        try:
+            self.lock.acquire()
+            self.map[path] = nodes
+        finally:
+            self.lock.release()
+
 
     def get(self, path):
         return self.map.get(path)
@@ -650,7 +659,8 @@ class SetDataReq(Record):
 
     def __str__(self):
         return "SetDataReq{path=%s, data=%s, ver=%d}" % (self.path, self.data, self.ver)
-            
+
+
 class SetDataResponse(Record):
     def __init__(self):
         super(SetDataResponse, self).__init__()
@@ -704,6 +714,7 @@ class SetWatchesResp(Record):
 
         def deserialize(self, in_stream):
             return self
+
 
 class NopResp(Record):
     def __init__(self):
@@ -849,7 +860,7 @@ class DeleteReq(Record):
     def serialize(self, out):
         self.write_str(self.path, out)
         self.write_int(self.ver, out)
-    
+
     def deserialize(self, in_stream):
         self.path = self.read_str(in_stream)
         self.ver = self.read_int(in_stream)
@@ -918,7 +929,6 @@ class WatcherEvent(Record):
         self.path = path
         return self
 
-
     def deserialize(self, in_stream):
         self.type = self.read_int(in_stream)
         self.state = self.read_int(in_stream)
@@ -929,7 +939,7 @@ class WatcherEvent(Record):
         self.write_int(self.type, out)
         self.write_int(self.state, out)
         self.write_str(self.path, out)
-        
+
     def __str__(self):
         if self.type:
             return "WatcherEvent{type=%d, state=%d, path=%s}" % (self.type, self.state, self.path)
@@ -964,16 +974,11 @@ def iter_all_child(sock_pair, child_list, name):
             child_packet.reply_header.deserialize(rfile)
             child_packet.deserialize(rfile)
             if child_packet.reply_header.err == 0 and child_packet.response.childrens:
-                logger.debug(child_packet.response.childrens)
-                zkCache.put(node_name, child_packet.response.childrens)
-                iter_all_child(sock_pair, child_packet.response.childrens, node_name)
+                return child_packet.response.childrens
+                #logger.debug(child_packet.response.childrens)
+                #zkCache.put(node_name, child_packet.response.childrens)
+                #iter_all_child(sock_pair, child_packet.response.childrens, node_name)
 
-
-import SocketServer
-
-from Queue import Queue
-
-import threading
 
 
 class NopCallback(object):
@@ -986,6 +991,7 @@ NopDo = NopCallback()
 
 
 class ExitSignal(object): pass
+
 
 
 class BlockZkClient(object):
@@ -1074,7 +1080,6 @@ class ZkClient(object):
                 if packet.header.type != OpCode.ping:
                     self.pending_queue.put((packet, callback))
             except:
-                # TODO reconnect and resend packet
                 logger.error("start_write %s resend %s futures" % (traceback.format_exc(), packet))
                 self.state = ProxyState.BROKEN
                 self.queue.put((packet, callback))
@@ -1160,10 +1165,7 @@ class ZkClient(object):
 
     def close(self):
         self.finish()
-        self.wfile.close()
-        self.rfile.close()
-        self.sock.close()
-
+        
     def reconnect(self):
         self.connect()
         logger.warn("reconnect to %s:%d" % self.sock.getpeername())
@@ -1273,9 +1275,11 @@ class ClientHandler(object):
         except:
             logger.debug("got proxyed packet err %s" % traceback.format_exc())
 
-
-
     def handle_read(self):
+        '''
+        parse client request
+        if req type is GetChildReq,```
+        '''
         try:
             while self.running:
                 if self.state == ProxyState.INIT:
@@ -1293,6 +1297,7 @@ class ClientHandler(object):
                     if req_header.type not in OpCodeMap:
                         logger.debug("no such req type %d" % req_header.type)
                     else:
+                        #forward req to real zk server
                         reqcls, respcls = OpCodeMap[req_header.type]
                         req = reqcls().deserialize(self.rfile)
                         req_packet = Packet(req_header, req, ReplyHeader(), respcls())
@@ -1313,6 +1318,7 @@ class ClientHandler(object):
         self.zkclient.close()
 
     def handle_write(self):
+        '''forward zk server response to client'''
         while True:
             packet = self.client_write_queue.get()
             if not packet:
@@ -1358,124 +1364,139 @@ class ZkProxy(object):
         ClientHandler(client_sock, self.zkhost, self.zkport).start()
 
 
+class GetChildWorker(object):
+    def __init__(self, client):
+        self.client = client
+
+        def callback(self, resp):
+            logger.debug("got resp %s" % resp)
+
+        def __call__(self):
+            while True:
+                get_child_req = GetChildReq().build("/dubbo", False)
+                child_packet = Packet(RequestHeader(Xid.next_xid(), OpCode.getChildren), get_child_req, ReplyHeader(), GetChildResp())
+                self.client.send_packet((child_packet, self.callback))
+                time.sleep(0.5)
+
+
+
+class Worker(object):
+    def __init__(self, master, zkhost, zkport):
+        self.queue = master.queue
+        self.running = False
+        self.client = ZkClient(zkhost, zkport)
+        self.master = master
+
+    def submit(self, parent, node):
+        self.queue.put((parent, node))
+
+    def notify(self, parent, packet):
+        self.master.notify((parent, packet))
+
+    def run(self):
+        self.running = True
+        self.client.connect()
+        logger.debug("Worker Thread started")
+        while self.running:
+            parent, node = self.queue.get()
+            nodename = "%s/%s" % (parent, node)
+            logger.debug("getChild for %s" % nodename)
+            get_child_req = GetChildReq().build(nodename, False)
+            child_packet = Packet(RequestHeader(Xid.next_xid(), OpCode.getChildren), get_child_req, ReplyHeader(), GetChildResp())
+            callback = partial(self.notify, parent)
+            self.client.send_packet((child_packet, callback))
+        logger.debug("worker exit")    
+
+    def close(self):
+        self.client.close()
+
+class ControlMaster(object):
+    def __init__(self, bootstrap_nodes, pool_size, zkhost, zkport):
+        self.tasks = []
+        self.zkcache = None
+        self.pool_size = pool_size
+        self.zkhost = zkhost
+        self.zkport = zkport
+        self.queue = Queue()
+        self.bootstrap_nodes = bootstrap_nodes
+        self.last = time.time()
+        self.await = Queue()
+
+    def on_idle(self):
+        for worker in self.tasks:
+            worker.close()
+
+        self.await.put(ExitSignal)
+
+    def detect_idle(self):
+        while True:
+            if time.time() - self.last > 5:
+                self.on_idle()
+                break
+            time.sleep(1)
+
+    def initworker(self):
+        '''
+        create worker thread
+        '''
+        for _ in range(self.pool_size):
+            worker = Worker(self, self.zkhost, self.zkport)
+            thread = threading.Thread(target=worker.run)
+            thread.setDaemon(True)
+            thread.start()
+            self.tasks.append(worker)
+
+    def notify(self, nodes):
+        '''
+        1. receive nodelist
+        2. add nodelist to map
+        3. split nodelist to single node set
+        4. put single to tasker
+        5. wait notify
+        node: {"/dubbo":"com.supercom.eif"}
+        '''
+        self.last = time.time()
+        parent, packet = nodes
+        path = packet.request.path
+        if packet.response.childrens:
+            zkCache.put(path, packet.response.childrens)
+        for child in packet.response.childrens:
+            nodename = "%s/%s" % (path, child)
+            self.queue.put((path, child))
+
+    def start(self):
+        self.initworker()
+        threading.Thread(target=self.detect_idle).start()
+        zkCache.put("/dubbo", self.bootstrap_nodes)
+        for node in self.bootstrap_nodes:
+            self.queue.put(("/dubbo", node))
+
+    def wait(self):
+        self.await.get()
+
+
 if __name__ == "__main__":
 
-    #class GetChildInteval(object):
-    #    def __init__(self, client):
-    #        self.client = client
+    # zkclient = ZkClient("192.168.10.217", 2182)
+    # zkclient.connect()
+    # threading.Thread(target=GetChildInteval(zkclient)).start()
+    # time.sleep(1000000000)
 
-    #    def callback(self, resp):
-    #        logger.debug("got resp %s" % resp)
+    client = BlockZkClient("192.168.10.52", 2182)
+    client.connect()
+    start = time.time()
+    try:
+        bootstrap = iter_all_child((client.rfile, client.wfile), ["dubbo"], "")
+        master = ControlMaster(bootstrap, 10, "192.168.10.217", 2182)
+        master.start()
+        master.wait()
+    except:
+        logger.error(traceback.format_exc())
 
-    #    def __call__(self):
-    #        while True:
-    #            get_child_req = GetChildReq().build("/dubbo", False)
-    #            child_packet = Packet(RequestHeader(Xid.next_xid(), OpCode.getChildren), get_child_req, ReplyHeader(), GetChildResp())
-    #            self.client.send_packet((child_packet, self.callback))
-    #            time.sleep(0.5)
-
-
-    #zkclient = ZkClient("192.168.10.217", 2182)
-    #zkclient.connect()
-    #threading.Thread(target=GetChildInteval(zkclient)).start()
-    #time.sleep(1000000000)
-
-    #client = BlockZkClient("192.168.10.52", 2182)
-    #client.connect()
-    #start = time.time()
-    #try:
-    #    iter_all_child((client.rfile, client.wfile), ["dubbo"], "")
-    #except:
-    #    pass
-
-    #from pprint import pprint
-    #print("total node is %d" % len(zkCache.map))
-    #print("耗时 %f" % (time.time() - start))
-
-    zkproxy = ZkProxy("192.168.66.181", 2182, "192.168.10.217", 2182)
-    logger.debug("waitting for request...")
-    zkproxy.serve_forever()
-
-    #get_child_req = GetChildReq("/dubbo", False)
-    #child_packet = Packet(RequestHeader(Xid.next_xid(), OpCode.getChildren), get_child_req, ReplyHeader(), GetChildResp())
-    #zk.send_packet(child_packet)
-
-    #time.sleep(8)
-    #get_child_req = GetChildReq("/dubbo", False)
-    #child_packet = Packet(RequestHeader(Xid.next_xid(), OpCode.getChildren), get_child_req, ReplyHeader(), GetChildResp())
-    #zk.send_packet(child_packet)
-    #time.sleep(1)
+    print("total node is %d" % len(zkCache.map))
+    print("耗时 %f" % (time.time() - start))
 
 
-    #zk_sock = socket(AF_INET, SOCK_STREAM)
-    #zk_sock.connect(("192.168.10.52", 2182))
-    #password = struct.pack(">QQ", 0, 0)
-    #conn_req = ConnectReq(0, 0, 60000, 0, password)
-
-    #buff_io = StringIO()
-    #conn_req.serialize(buff_io)
-    #body_len = struct.pack(">i", len(buff_io.getvalue()))
-    #wfile = zk_sock.makefile("wb")
-    #rfile = zk_sock.makefile("rb")
-    #wfile.write(body_len)
-    #wfile.write(buff_io.getvalue())
-    #wfile.flush()
-    #
-    #resp_body_len = struct.unpack(">i", rfile.read(4))[0]
-    #conn_resp = ConnectResp()
-    #conn_resp.deserialize(rfile)
-    #print(conn_resp)
-    #ping_req = Ping()
-
-    #exist_req = ExistsReq()
-    #exist_req.build("/dubbo1", False)
-
-
-    ##while True:
-    ##for i in range(10):
-    #exists_packet = Packet(RequestHeader(Xid.next_xid(),OpCode.exists), exist_req, ReplyHeader(), SetDataResponse())
-    #send_packet(wfile, exists_packet)
-    #exists_packet.deserialize(rfile)
-    #print(exists_packet)
-
-    ##TODO get children node for /dubbo
-
-    #print("get chlid for /dubbo" )
-    #get_child_req = GetChildReq("/dubbo", False)
-    #child_packet = Packet(RequestHeader(Xid.next_xid(), OpCode.getChildren), get_child_req, ReplyHeader(), GetChildResp())
-    #send_packet(wfile, child_packet)
-    #child_packet.deserialize(rfile)
-    #child_list = child_packet.response.childrens
-    #print(child_list)
-    
-    #TODO create node 
-    #create_node_req = CreateReq().build("/TASK_UNSAFE1", "unsafe1" , [Acl().build(Perms.ALL, Ids.ANYONE_ID_UNSAFE)], 0)
-    #create_node_packet = Packet(RequestHeader(Xid.next_xid(), OpCode.create), create_node_req, ReplyHeader(), CreateResp())
-    #send_packet(wfile, create_node_packet)
-    #create_node_packet.deserialize(rfile)
-    #print(create_node_packet)
-
-    
-    #del_node_req = DeleteReq().build("TASK_UNSAFE", -1)
-    #del_node_packet = Packet(RequestHeader(Xid.next_xid(), OpCode.delete), del_node_req, ReplyHeader(), NopResp())
-    #send_packet(wfile, del_node_packet)
-    #del_node_packet.deserialize(rfile)
-    #iter_all_child(["TASK_UNSAFE1"], "")
-
-    #TODO read data for child
-    #get_node_req = GetDataReq().build("/dubbo", False)
-    #get_node_packet = Packet(RequestHeader(Xid.next_xid(), OpCode.getData), get_node_req, ReplyHeader(), GetDataResp(), WatcherEvent())
-    #send_packet(wfile, get_node_packet)
-    #get_node_packet.deserialize(rfile)
-    #print(get_node_packet) 
-    #time.sleep(1)
-
-
-    #TODO setwatches
-    #set_watch_req = SetWatches().build(Xid.last_zxid, ["/dubbo"], [], ["/dubbo"])
-    #set_watch_packet = Packet(RequestHeader(Xid.SET_WATCHE, OpCode.setWatches), set_watch_req, ReplyHeader(), NopResp(), WatcherEvent())
-    #send_packet(wfile, set_watch_packet)
-    #while True:
-    #    print(set_watch_packet.deserialize(rfile))
-    #    time.sleep(1)
-    #zk_sock.close()
+    #start zk proxy and start serve
+    #zkproxy = ZkProxy("192.168.66.181", 2182, "192.168.10.217", 2182)
+    #zkproxy.serve_forever()
