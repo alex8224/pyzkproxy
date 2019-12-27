@@ -6,14 +6,15 @@ zookeeper proxy
 2. cache some node
 '''
 
-# from gevent import monkey
-# monkey.patch_all()
+from gevent import monkey
+monkey.patch_all()
 
 from socket import socket, AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
 from functools import partial
 from collections import OrderedDict
 from Queue import Queue
 import threading
+import json
 import time
 import struct
 import traceback
@@ -53,6 +54,9 @@ class ZkCache(object):
 
     def __str__(self):
         return str(self.map)
+
+    def exists(self, ele):
+        return ele in self.map
 
 
 class OpCode(object):
@@ -785,6 +789,7 @@ class Packet(object):
         self.watcher = watcher
         self.callback = callback
         self.buff = buff
+        self.proxyed = False
 
     def serialize(self):
         buff = StringIO()
@@ -1097,9 +1102,12 @@ class ZkClient(object):
     def start_read(self):
         try:
             while self.running:
+                if self.state == ProxyState.DISCONNECTED:
+                    break
+
                 len_buff = self.rfile.read(4)
                 if not len_buff or len(len_buff) < 4:
-                    logger.error("peer close connection %s:%d" % self.sock.getpeername())
+                    logger.error("peer close connection %s:%d" % self.sockname)
                     self.state = ProxyState.BROKEN
                     break
                 resp_len = struct.unpack(">i", len_buff)[0]
@@ -1121,7 +1129,7 @@ class ZkClient(object):
                     logger.debug("got reply %s" % pending_packet)
                     if callback:
                         callback(pending_packet)
-            logger.info("start_read exit")
+            logger.warn("start_read exit")
             self.finish()
             if self.state == ProxyState.BROKEN:
                 self.reconnect()
@@ -1146,12 +1154,14 @@ class ZkClient(object):
     def connect(self):
         self.sock = socket(AF_INET, SOCK_STREAM)
         self.sock.connect((self.host, self.port))
+        self.sockname = self.sock.getpeername()
         self.wfile = self.sock.makefile("wb")
         self.rfile = self.sock.makefile("rb")
         self.init()
 
     def finish(self):
         self.running = False
+        self.state = ProxyState.DISCONNECTED
         self.queue.put((ExitSignal(), NopDo))
         if self.rfile:
             self.rfile.close()
@@ -1258,8 +1268,9 @@ class ClientHandler(object):
         logger.debug("proxy connection started... %s" % conn_resp)
 
     def process_event(self, event):
+        #TODO update cache via event
         reply_len, reply_header, watcher = event
-        logger.debug("got event %s %s" % (reply_header, watcher))
+        logger.warn("got event %s %s" % (reply_header, watcher))
         io_buff = StringIO()
         try:
             record = Record()
@@ -1273,6 +1284,8 @@ class ClientHandler(object):
 
     def callback(self, packet):
         try:
+            if packet.proxyed:
+                logger.warn("======== proxyed packet %s" % packet)
             self.client_write_queue.put(packet)
         except:
             logger.debug("got proxyed packet err %s" % traceback.format_exc())
@@ -1286,6 +1299,8 @@ class ClientHandler(object):
             while self.running:
                 if self.state == ProxyState.INIT:
                     self.ack_connect()
+                if self.state == ProxyState.DISCONNECTED:
+                    break
                 elif self.state == ProxyState.CONNECTED:
                     req_len = struct.unpack(">i", self.rfile.read(4))[0]
                     req_header = RequestHeader(0, 0)
@@ -1306,6 +1321,7 @@ class ClientHandler(object):
                         logger.debug("req %s " % (req_packet, ))
                         if not self.do_filter_handler(req_packet):
                             self.zkclient.send_packet((req_packet, self.callback))
+            logger.warn("handle_read exit")                
         except:
             logger.error("handle_read error %s" % (traceback.format_exc(), ))
             self.running = False
@@ -1327,14 +1343,32 @@ class ClientHandler(object):
 
     def intecept_create(self, create_req):
         if zkCache.get(create_req.request.path):
-            #TODO set reply header to 
             reply_header = create_req.reply_header
             reply_header.build(create_req.header.xid, 0, ErrCode.NodeExists)
             self.callback(create_req)
-            logger.warn("return cache for %s" % create_req)
+            # logger.warn("return cache for %s" % create_req)
             return True
         else:
-            return False
+            logger.warn("createreq %s not in cache" % create_req.request.path)
+            path = create_req.request.path
+            child_index = path.rfind("/")
+            if child_index > -1:
+                parent, child = path[:child_index], path[child_index + 1:]
+                if zkCache.exists(parent):
+                    child_list = zkCache.get(parent) or []
+                    if child not in child_list:
+                        child_list.append(child)
+                        zkCache.put(parent, child_list)
+                        reply_header = create_req.reply_header
+                        reply_header.build(create_req.header.xid, 0, 0)
+                        create_req.response.path = path
+                        create_req.proxyed = True
+                        logger.warn("put %s=%s to cache, final child is %s" % (parent, child, child_list))
+                        self.callback(create_req)
+                        return True
+            else:
+                logger.warn("splitor not found in %s" % path)
+                return False
 
     def intecept_exists(self, exists_req):
         if zkCache.get(exists_req.request.path):
@@ -1342,10 +1376,12 @@ class ClientHandler(object):
             reply_header.build(exists_req.header.xid, 0, 0)
             response = exists_req.response
             stat = Stat()
-            response.stat = Stat().build(0,0,0,0,0,0,0,0,0,0,0)
+            response.stat = Stat().build(0,0,0,0,0,0,0,0,0,0,00)
             self.callback(exists_req)
             logger.warn("return cache exists for %s" % exists_req)
             return True
+        else:
+            return False
 
 
     def intecept_getchild(self, getchild_req):
@@ -1363,6 +1399,8 @@ class ClientHandler(object):
         self.client_write_queue.put(pong_packet)
 
     def finish(self):
+        self.client_write_queue.put(ExitSignal())
+        self.state = ProxyState.DISCONNECTED
         self.zkclient.close()
 
     def handle_write(self):
@@ -1372,11 +1410,14 @@ class ClientHandler(object):
             if not packet:
                 continue
             else:
+                if isinstance(packet, ExitSignal):
+                    break
                 if packet.buff:
                     send_buff(self.wfile, packet.buff)
                 else:
                     buff = packet.serialize_forward()
                     send_buff(self.wfile, buff)
+        logger.warn("handle_write exit")
 
     def start(self):
         self.init_filter_chain()
@@ -1411,22 +1452,6 @@ class ZkProxy(object):
 
     def process_request(self, client_sock):
         ClientHandler(client_sock, self.zkhost, self.zkport).start()
-
-
-class GetChildWorker(object):
-    def __init__(self, client):
-        self.client = client
-
-        def callback(self, resp):
-            logger.debug("got resp %s" % resp)
-
-        def __call__(self):
-            while True:
-                get_child_req = GetChildReq().build("/dubbo", False)
-                child_packet = Packet(RequestHeader(Xid.next_xid(), OpCode.getChildren), get_child_req, ReplyHeader(), GetChildResp())
-                self.client.send_packet((child_packet, self.callback))
-                time.sleep(0.5)
-
 
 
 class Worker(object):
