@@ -6,14 +6,12 @@ zookeeper proxy
 2. cache some node
 '''
 
-from gevent import monkey
-monkey.patch_all()
-
 from socket import socket, AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
 from functools import partial
 from collections import OrderedDict
 from Queue import Queue
 import threading
+import sys
 import json
 import time
 import struct
@@ -1549,24 +1547,41 @@ class ControlMaster(object):
         self.await.get()
 
 
+LEVEL = {"debug": logging.DEBUG , "info": logging.INFO, "warn":logging.WARN, "error": logging.ERROR}
+
+def set_loglevel():
+    if len(sys.argv) == 6:
+        level = sys.argv[5]
+    else:
+        level = "debug"
+
+    logger.setLevel(LEVEL.get(level))
+    print("set logger level to %s" % level)
+
 if __name__ == "__main__":
 
-    client = BlockZkClient("192.168.10.217", 2182)
-    client.connect()
-    start = time.time()
-    try:
-        bootstrap = iter_all_child((client.rfile, client.wfile), ["dubbo"], "")
-        master = ControlMaster(bootstrap, 10, "192.168.10.217", 2182)
-        master.start()
-        master.wait()
+    if len(sys.argv) < 5:
+        print("usage: zkclient zkhost, zkport ,listenhost, listenport [debug|info|warn|error]")
+    else:
+        zkhost, zkport, listenhost, listenport = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+        set_loglevel()
+        client = BlockZkClient(zkhost, zkport)
+        client.connect()
+        start = time.time()
+        try:
+            bootstrap = iter_all_child((client.rfile, client.wfile), ["dubbo"], "")
+            master = ControlMaster(bootstrap, 10, zkhost, zkport)
+            master.start()
+            master.wait()
+            
+            print("zkproxy started")
+            # start zk proxy and start serve
+            zkproxy = ZkProxy(listenhost, listenport, zkhost, zkport)
+            zkproxy.serve_forever()
+        except:
+            logger.error(traceback.format_exc())
 
-    # start zk proxy and start serve
-        zkproxy = ZkProxy("192.168.66.181", 2182, "192.168.10.217", 2182)
-        zkproxy.serve_forever()
-    except:
-        logger.error(traceback.format_exc())
-
-    print("total node is %d" % len(zkCache.map))
-    print("耗时 %f" % (time.time() - start))
+        print("total node is %d" % len(zkCache.map))
+        print("time %f" % (time.time() - start))
 
 
