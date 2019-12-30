@@ -22,7 +22,7 @@ from StringIO import StringIO
 FORMAT = '%(asctime)-15s - %(threadName)s - %(message)s'
 logging.basicConfig(file="zkclient.log", filemode="w", format=FORMAT)
 logger = logging.getLogger('zkproxy')
-logger.setLevel(logging.WARN)
+logger.setLevel(logging.DEBUG)
 
 
 class Node(object):
@@ -1268,7 +1268,7 @@ OpCodeMap = {
 
 
 class ClientHandler(object):
-    def __init__(self, sock, zkhost, zkport):
+    def __init__(self, sock, zkhost, zkport, ignore_path = None):
         self.zkclient = ZkClient(zkhost, zkport)
         self.client = sock
         self.wfile = sock.makefile("wb")
@@ -1277,6 +1277,7 @@ class ClientHandler(object):
         self.client_write_queue = Queue()
         self.xid = -100
         self.running = True
+        self.ignore_path = ["/Cache_default", "/TaskLock"]
 
     def ack_connect(self):
         req_len = struct.unpack(">i", self.rfile.read(4))[0]
@@ -1296,6 +1297,15 @@ class ClientHandler(object):
         buff_io.close()
         self.state = ProxyState.CONNECTED
         logger.debug("proxy connection started... %s" % conn_resp)
+
+    def not_in_ignore(self, path):
+        if not self.ignore_path:
+            return True
+        else:
+            for ipath in self.ignore_path:
+                if path.startswith(ipath):
+                    return False
+            return True
 
     def process_event(self, event):
         #TODO update cache via event
@@ -1353,7 +1363,7 @@ class ClientHandler(object):
                             self.zkclient.send_packet((req_packet, self.callback))
             logger.warn("handle_read exit")                
         except:
-            logger.error("handle_read error %s" % (traceback.format_exc(), ))
+            logger.error("handle_read error %s " % (traceback.format_exc(), ))
             self.running = False
             self.state = ProxyState.DISCONNECTED
         finally:
@@ -1364,6 +1374,10 @@ class ClientHandler(object):
         self.chain = {CreateReq: self.intecept_create, GetChildReq: self.intecept_getchild, ExistsReq: self.intecept_exists}
 
     def do_filter_handler(self, packet):
+        path = packet.request.path
+        if not self.not_in_ignore(path):
+            logger.debug("ignore path %s" % path)
+            return False
         handler = self.chain.get(packet.request.__class__)
         if handler:
             return handler(packet)
@@ -1409,7 +1423,7 @@ class ClientHandler(object):
 
 
     def intecept_getchild(self, getchild_req):
-        childrens = zkCache.get(getchild_req.request.path) or []
+        childrens = zkCache.get(getchild_req.request.path)
         reply_header = getchild_req.reply_header
         reply_header.build(getchild_req.header.xid, 0, 0)
         response = getchild_req.response
