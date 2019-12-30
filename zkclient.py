@@ -49,13 +49,6 @@ class ZkCache(object):
 
     def get(self, path):
         return self.map.get(path) or []
-        #parent, child = self.split(path)
-        #if child:
-        #    parent, child = parts
-        #    child_list = self.map.get(parent) or []
-        #    return child_list
-        #else:
-        #    return self.map.get(path)
 
     def ensure_node(self, path):
         if path not in self.map:
