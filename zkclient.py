@@ -48,13 +48,45 @@ class ZkCache(object):
             self.lock.release()
 
     def get(self, path):
-        return self.map.get(path)
+        return self.map.get(path) or []
+        #parent, child = self.split(path)
+        #if child:
+        #    parent, child = parts
+        #    child_list = self.map.get(parent) or []
+        #    return child_list
+        #else:
+        #    return self.map.get(path)
+
+    def ensure_node(self, path):
+        if path not in self.map:
+            try:
+                logger.error("======ensure node %s in map" % path)
+                self.lock.acquire()
+                self.map[path] = []
+            finally:
+                self.lock.release()
+
+    def keys(self):
+        return self.map.keys()
 
     def __str__(self):
         return str(self.map)
 
+    def split(self, path):
+        child_index = path.rfind("/")
+        if child_index > -1:
+            parent, child = path[:child_index], path[child_index + 1:]
+            return parent, child
+        else:
+            return path, None
+
     def exists(self, ele):
-        return ele in self.map
+        parent, child = self.split(ele)
+        if child:
+            child_list = self.map.get(parent) or []
+            return child in child_list
+        else:
+            return ele in self.map
 
 
 class OpCode(object):
@@ -1340,36 +1372,30 @@ class ClientHandler(object):
             return False
 
     def intecept_create(self, create_req):
-        if zkCache.get(create_req.request.path):
+        if zkCache.exists(create_req.request.path):
             reply_header = create_req.reply_header
             reply_header.build(create_req.header.xid, 0, ErrCode.NodeExists)
             self.callback(create_req)
-            # logger.warn("return cache for %s" % create_req)
+            logger.warn("return cache for %s" % create_req)
             return True
         else:
             logger.warn("createreq %s not in cache" % create_req.request.path)
             path = create_req.request.path
-            child_index = path.rfind("/")
-            if child_index > -1:
-                parent, child = path[:child_index], path[child_index + 1:]
-                if zkCache.exists(parent):
-                    child_list = zkCache.get(parent) or []
-                    if child not in child_list:
-                        child_list.append(child)
-                        zkCache.put(parent, child_list)
-                        reply_header = create_req.reply_header
-                        reply_header.build(create_req.header.xid, 0, 0)
-                        create_req.response.path = path
-                        create_req.proxyed = True
-                        logger.warn("put %s=%s to cache, final child is %s" % (parent, child, child_list))
-                        self.callback(create_req)
-                        return True
-            else:
-                logger.warn("splitor not found in %s" % path)
-                return False
+            parent, child = zkCache.split(path)
+            logger.warn("try add %s to cache path %s " % (child, parent))
+            child_list = zkCache.get(path)
+            child_list.append(child)
+            zkCache.put(parent, child_list)
+            reply_header = create_req.reply_header
+            reply_header.build(create_req.header.xid, 0, 0)
+            create_req.response.path = path
+            create_req.proxyed = True
+            logger.warn("put %s=%s to cache, final child is %s" % (parent, child, child_list))
+            self.callback(create_req)
+            return True
 
     def intecept_exists(self, exists_req):
-        if zkCache.get(exists_req.request.path):
+        if zkCache.exists(exists_req.request.path):
             reply_header = exists_req.reply_header
             reply_header.build(exists_req.header.xid, 0, 0)
             response = exists_req.response
@@ -1558,6 +1584,100 @@ def set_loglevel():
     logger.setLevel(LEVEL.get(level))
     print("set logger level to %s" % level)
 
+
+class TelnetServer(threading.Thread):
+    '''
+    1. receive cmd param \r\n
+    2. execute cmd with param and write response
+    3. if cmd is quit, then close socket
+    '''
+
+    def __init__(self, host, port):
+        super(TelnetServer, self).__init__()
+        self.setDaemon(True)
+        self.host = host
+        self.port = port
+        self.zkCache = zkCache
+        self.server_sock = None
+
+    def run(self):
+        self.listen()
+        print("simple telnet server started listen on %s:%d" % (self.host, self.port))
+        while True:
+            client, addr = self.server_sock.accept()
+            print("accept client %s:%d" % addr)
+            self.handle_request(client)
+
+    def listen(self):
+        self.server_sock = socket(AF_INET, SOCK_STREAM)
+        self.server_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+        self.server_sock.bind((self.host, self.port))
+        self.server_sock.listen(128)
+
+
+    def writeline(self, val):
+        self.wfile.write(val + "\r\n")
+        self.wfile.flush()
+
+    def process_cmd(self, cmd):
+        cmd_args = cmd.split()
+        if len(cmd_args) == 0:
+            return
+        cmd = cmd_args[0]
+        if cmd in ["get", "len", "find", "split", "map.get"] and len(cmd_args) < 2:
+            self.writeline("cmd %s need args" % cmd)
+            return
+        if cmd == "get":
+            args = cmd_args[1]
+            val = self.zkCache.get(args)
+            valstr = json.dumps(val, True)
+            self.writeline(valstr)
+        elif cmd == "len":
+            args = cmd_args[1]
+            val = self.zkCache.get(args)
+            if val:
+                val_len = len(val)
+                self.writeline(str(val_len))
+            else:
+                self.writeline("%s not found" % args)
+        elif cmd =="keys":
+            val = self.zkCache.keys()
+            self.writeline(json.dumps(val, True))
+        elif cmd == "find":
+            args = cmd_args[1]
+            vals = []
+            for k, v in self.zkCache.map.iteritems():
+                if k.find(args) > -1:
+                    vals.append(k)
+            self.writeline(json.dumps(vals, True))
+        elif cmd == "split":
+            args = cmd_args[1]
+            parent, child = self.zkCache.split(args)
+            self.writeline("parent=%s, child=%s" % (parent, child))
+        elif cmd =="map.get":
+            args = cmd_args[1]
+            val = self.zkCache.map.get(args)
+            self.writeline(json.dumps(val, True))
+        else:
+            self.writeline("unsupported cmd %s")
+
+    def close(self, client):
+        self.rfile.close()
+        self.wfile.close()
+        client.close()
+
+    def handle_request(self, client):
+        self.rfile = client.makefile("r")
+        self.wfile = client.makefile("w")
+        while True:
+            cmdline = self.rfile.readline().strip()
+            if cmdline == "quit":
+                self.close(client)
+                break
+            else:
+                self.process_cmd(cmdline)
+
+    
 if __name__ == "__main__":
 
     if len(sys.argv) < 5:
@@ -1574,6 +1694,7 @@ if __name__ == "__main__":
             master.start()
             master.wait()
             
+            TelnetServer("127.0.0.1", 2222).start()
             print("zkproxy started")
             # start zk proxy and start serve
             zkproxy = ZkProxy(listenhost, listenport, zkhost, zkport)
