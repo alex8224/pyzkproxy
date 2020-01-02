@@ -9,7 +9,7 @@ zookeeper proxy
 from socket import socket, AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
 from functools import partial
 from collections import OrderedDict
-from Queue import Queue
+from Queue import Queue, LifoQueue
 import threading
 import sys
 import json
@@ -53,7 +53,6 @@ class ZkCache(object):
     def ensure_node(self, path):
         if path not in self.map:
             try:
-                logger.error("======ensure node %s in map" % path)
                 self.lock.acquire()
                 self.map[path] = []
             finally:
@@ -687,7 +686,7 @@ class SetDataReq(Record):
         return self
 
     def __str__(self):
-        return "SetDataReq{path=%s, data=%s, ver=%d}" % (self.path, self.data, self.ver)
+        return "SetDataReq{path=%s, data=anydata, ver=%d}" % (self.path, self.ver)
 
 
 class SetDataResponse(Record):
@@ -943,7 +942,7 @@ class GetDataResp(Record):
         return self
 
     def __str__(self):
-        return "GetDataResq{data=%s, stat=%s}" % (str(self.data) if self.data else "", str(self.stat) if self.stat else "")
+        return "GetDataResq{data=anydata, stat=%s}" % (str(self.stat) if self.stat else "")
 
 
 class WatcherEvent(Record):
@@ -1271,6 +1270,7 @@ class ClientHandler(object):
         self.xid = -100
         self.running = True
         self.ignore_path = ["/Cache_default", "/TaskLock"]
+        self.heartbeat = 3600000*24
 
     def ack_connect(self):
         req_len = struct.unpack(">i", self.rfile.read(4))[0]
@@ -1281,7 +1281,7 @@ class ClientHandler(object):
         conn_req.deserialize(io_buff)
         io_buff.close()
 
-        conn_resp = ConnectResp().build(0, 5000, ZkSess.next_session_id, "1234567890123456")
+        conn_resp = ConnectResp().build(0, self.heartbeat, ZkSess.next_session_id, "1234567890123456")
         buff_io = StringIO()
         conn_resp.serialize(buff_io)
         resp_len = struct.pack(">i", len(buff_io.getvalue()))
@@ -1324,10 +1324,6 @@ class ClientHandler(object):
             logger.debug("got proxyed packet err %s" % traceback.format_exc())
 
     def handle_read(self):
-        '''
-        parse client request
-        if req type is GetChildReq,```
-        '''
         try:
             while self.running:
                 if self.state == ProxyState.INIT:
@@ -1354,6 +1350,7 @@ class ClientHandler(object):
                         logger.debug("req %s " % (req_packet, ))
                         if not self.do_filter_handler(req_packet):
                             self.zkclient.send_packet((req_packet, self.callback))
+                            logger.debug("forward %s to real server" % req_packet)
             logger.warn("handle_read exit")                
         except:
             logger.error("handle_read error %s " % (traceback.format_exc(), ))
@@ -1367,14 +1364,14 @@ class ClientHandler(object):
         self.chain = {CreateReq: self.intecept_create, GetChildReq: self.intecept_getchild, ExistsReq: self.intecept_exists}
 
     def do_filter_handler(self, packet):
-        path = packet.request.path
-        if not self.not_in_ignore(path):
-            logger.debug("ignore path %s" % path)
-            return False
         handler = self.chain.get(packet.request.__class__)
         if handler:
-            return handler(packet)
-            #return False
+            path = packet.request.path
+            if not self.not_in_ignore(path):
+                logger.debug("ignore path %s" % path)
+                return False
+            else:
+                return handler(packet)
         else:
             return False
 
@@ -1448,6 +1445,8 @@ class ClientHandler(object):
                 else:
                     buff = packet.serialize_forward()
                     send_buff(self.wfile, buff)
+                    if not isinstance(packet.reply_header, Pong):
+                        logger.debug("write zk response %s to client" % packet)
         logger.warn("handle_write exit")
 
     def start(self):
