@@ -812,6 +812,7 @@ class Packet(object):
         self.callback = callback
         self.buff = buff
         self.proxyed = False
+        self.acked = False
 
     def serialize(self):
         buff = StringIO()
@@ -867,11 +868,12 @@ class Packet(object):
 
     def __str__(self):
         try:
-            return "Packet{header=%s, req=%s, reply=%s, resp=%s}" % (
+            return "Packet{header=%s, req=%s, reply=%s, resp=%s, acked=%s}" % (
                     str(self.header) if self.header else "",
                     str(self.request) if self.request else "",
                     str(self.reply_header) if self.reply_header else "",
-                    str(self.response) if self.response else "")
+                    str(self.response) if self.response else "",
+                    str(self.acked))
         except:
             logger.error(traceback.format_exc())
 
@@ -1052,6 +1054,13 @@ class BlockZkClient(object):
         conn_resp.deserialize(self.rfile)
         self.timeout = int(conn_resp.timeout / 1000)
         logger.debug("connect to %s:%d Ok. connect response is %s" % (self.host, self.port, conn_resp))
+
+    def close(self):
+        if self.rfile:
+            self.rfile.close()
+
+        if self.wfile:
+            self.wfile.close()
 
 
 class ZkClient(object):
@@ -1258,6 +1267,23 @@ OpCodeMap = {
             OpCode.setData: (SetDataReq, SetDataResponse),
 }
 
+class StringBuilder(object):
+    def __init__(self):
+        self.io_buff = StringIO()
+
+    def appendRN(self, line):
+        self.io_buff.write(line + "\r\n");
+        return self
+
+    def append(self, string):
+        self.io_buff.write(string)
+        return self
+
+    def __str__(self):
+        try:
+            return self.io_buff.getvalue()
+        finally:
+            self.io_buff.close()
 
 class ClientHandler(object):
     def __init__(self, sock, zkhost, zkport, ignore_path = None):
@@ -1271,6 +1297,8 @@ class ClientHandler(object):
         self.running = True
         self.ignore_path = ["/Cache_default", "/TaskLock"]
         self.heartbeat = 3600000*24
+        self.un_acked = OrderedDict()
+        self.lock = threading.Lock()
 
     def ack_connect(self):
         req_len = struct.unpack(">i", self.rfile.read(4))[0]
@@ -1300,6 +1328,9 @@ class ClientHandler(object):
                     return False
             return True
 
+    def in_ignore(self, path):
+        return not not_in_ignore(path)
+
     def process_event(self, event):
         #TODO update cache via event
         reply_len, reply_header, watcher = event
@@ -1316,12 +1347,38 @@ class ClientHandler(object):
             io_buff.close()
 
     def callback(self, packet):
+        if packet.proxyed and self.not_in_ignore(packet.request.path):
+            #packet from real zk server,ignore packet because clienthandler already return a cache packet instead it.
+            logger.debug("ignore from real zk server %s" % packet)
+            return
+
         try:
-            if packet.proxyed:
-                logger.warn("======== proxyed packet %s" % packet)
-            self.client_write_queue.put(packet)
+            self.lock.acquire()
+            xid = packet.header.xid    
+
+            if xid in self.un_acked and (not packet.acked):
+                logger.debug("ack %s" % packet)
+                packet.acked = True
+
+            self.un_acked[xid] = packet
+            ordered_packet_list = sorted(self.un_acked.items())
+            un_acked_list = filter(lambda p: p[1].acked == False, ordered_packet_list)
+
+            if len(un_acked_list) > 0:
+                str_buff = StringBuilder().append("[\n")
+                for _, un_acked_packet in un_acked_list:
+                    str_buff.append(str(un_acked_packet)).append(",\n")
+                str_buff.append("]\n")    
+                logger.error("still has some packet unacked %s" % str_buff);
+                return
+            else:
+                for _, acked_packet in ordered_packet_list:
+                    self.client_write_queue.put(acked_packet)
+                self.un_acked.clear()
         except:
-            logger.debug("got proxyed packet err %s" % traceback.format_exc())
+            logger.error("got proxyed packet err %s" % traceback.format_exc())
+        finally:
+            self.lock.release()
 
     def handle_read(self):
         try:
@@ -1348,6 +1405,7 @@ class ClientHandler(object):
                         req = reqcls().deserialize(self.rfile)
                         req_packet = Packet(req_header, req, ReplyHeader(), respcls())
                         logger.debug("req %s " % (req_packet, ))
+                        self.un_acked[req_header.xid] = req_packet
                         if not self.do_filter_handler(req_packet):
                             self.zkclient.send_packet((req_packet, self.callback))
                             logger.debug("forward %s to real server" % req_packet)
@@ -1379,24 +1437,24 @@ class ClientHandler(object):
         if zkCache.exists(create_req.request.path):
             reply_header = create_req.reply_header
             reply_header.build(create_req.header.xid, 0, ErrCode.NodeExists)
+            create_req.acked = True
             self.callback(create_req)
-            logger.warn("return cache for %s" % create_req)
+            logger.debug("return cache for %s" % create_req)
             return True
         else:
-            logger.warn("createreq %s not in cache" % create_req.request.path)
             path = create_req.request.path
             parent, child = zkCache.split(path)
-            logger.warn("try add %s to cache path %s " % (child, parent))
-            child_list = zkCache.get(path)
+            child_list = zkCache.get(parent)
             child_list.append(child)
             zkCache.put(parent, child_list)
             reply_header = create_req.reply_header
             reply_header.build(create_req.header.xid, 0, 0)
             create_req.response.path = path
-            create_req.proxyed = True
-            logger.warn("put %s=%s to cache, final child is %s" % (parent, child, child_list))
+            create_req.acked = True
             self.callback(create_req)
-            return True
+            create_req.proxyed = True
+            logger.debug("try add %s to cache path %s " % (child, parent))
+            return False #forward create_req to real zk server
 
     def intecept_exists(self, exists_req):
         if zkCache.exists(exists_req.request.path):
@@ -1405,8 +1463,9 @@ class ClientHandler(object):
             response = exists_req.response
             stat = Stat()
             response.stat = Stat().build(0,0,0,0,0,0,0,0,0,0,00)
+            exists_req.acked = True
             self.callback(exists_req)
-            logger.warn("return cache exists for %s" % exists_req)
+            logger.debug("return cache exists for %s" % exists_req)
             return True
         else:
             return False
@@ -1418,6 +1477,7 @@ class ClientHandler(object):
         reply_header.build(getchild_req.header.xid, 0, 0)
         response = getchild_req.response
         response.childrens = childrens
+        getchild_req.acked = True
         self.callback(getchild_req)
         logger.warn("return cache path's %s child in cache %s" % (getchild_req.request.path, childrens))
         return True
@@ -1620,7 +1680,6 @@ class TelnetServer(threading.Thread):
         self.server_sock.bind((self.host, self.port))
         self.server_sock.listen(128)
 
-
     def writeline(self, val):
         self.wfile.write(val + "\r\n")
         self.wfile.flush()
@@ -1665,7 +1724,7 @@ class TelnetServer(threading.Thread):
             val = self.zkCache.map.get(args)
             self.writeline(json.dumps(val, True))
         else:
-            self.writeline("unsupported cmd %s")
+            self.writeline("unsupported cmd %s" % cmd_args[0])
 
     def close(self, client):
         self.rfile.close()
@@ -1683,7 +1742,7 @@ class TelnetServer(threading.Thread):
             else:
                 self.process_cmd(cmdline)
 
-    
+
 if __name__ == "__main__":
 
     if len(sys.argv) < 5:
@@ -1699,6 +1758,7 @@ if __name__ == "__main__":
             master = ControlMaster(bootstrap, 10, zkhost, zkport)
             master.start()
             master.wait()
+            client.close()
             
             TelnetServer("127.0.0.1", 2222).start()
             print("zkproxy started")
